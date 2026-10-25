@@ -1,0 +1,13 @@
+{
+  "repository": "/srv/miminet",
+  "runs_dir": "/srv/coder-runs",
+  "runtime_root": "/srv/coder-runtime",
+  "model_socket": "/srv/coder-gateway/model.sock",
+  "model": "local-model",
+  "timeout_seconds": 600,
+  "max_steps": 20,
+  "policy": {
+    "read_files": ["front/src/miminet_admin.py"],
+    "write_files": ["front/src/miminet_admin.py"]
+  }
+}
