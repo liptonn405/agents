@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.0",
+  "task_id": "543",
+  "workspace_id": "workspace-543",
+  "attempt": 1,
+  "instructions": [
+    {
+      "file": "front/src/miminet_admin.py",
+      "operation": "modify",
+      "target": "SectionView.form_excluded_columns",
+      "requirements": [
+        "Добавить questions",
+        "Добавить quiz_sessions",
+        "Сохранить остальные значения без изменений"
+      ]
+    }
+  ],
+  "read_files": ["front/src/miminet_admin.py"],
+  "allowed_write_files": ["front/src/miminet_admin.py"],
+  "acceptance_criteria": [
+    "Поля questions и quiz_sessions включены в исключения формы",
+    "Другие поля формы не изменены"
+  ]
+}
