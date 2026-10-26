@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from .contracts import StrictModel
 
@@ -60,14 +61,25 @@ class Config(StrictModel):
     # A dedicated HTTP-over-Unix model gateway, never a general-purpose proxy.
     model_socket: str | None = None
     model: str = Field(default="local-model", pattern=r"^[A-Za-z0-9_.:-]+$")
+    model_context_tokens: int = Field(default=131_072, ge=1024, le=1_048_576)
+    model_output_tokens: int = Field(default=8192, ge=1, le=65_536)
+    model_reasoning_effort: Literal["none", "low", "medium", "high"] | None = None
+    model_temperature: float | None = Field(default=None, ge=0, le=2, allow_inf_nan=False)
     opencode_binary: str = "/usr/bin/opencode"
     python_binary: str = "/usr/bin/python3"
     bwrap_binary: str = "bwrap"
     timeout_seconds: int = Field(default=600, ge=1, le=7200)
+    model_request_timeout_seconds: int = Field(default=60, ge=1, le=7200)
     max_steps: int = Field(default=20, ge=1, le=100)
     max_log_bytes: int = Field(default=4_194_304, ge=1024, le=16_777_216)
     cpu_seconds: int = Field(default=300, ge=1, le=7200)
     process_limit: int = Field(default=256, ge=16, le=1024)
+
+    @model_validator(mode="after")
+    def validate_model_limits(self):
+        if self.model_output_tokens > self.model_context_tokens:
+            raise ValueError("Model output limit must not exceed its context limit")
+        return self
 
     def host_paths(self) -> tuple[Path, Path, Path]:
         paths = [Path(p) for p in (self.repository, self.runs_dir, self.runtime_root)]

@@ -20,6 +20,14 @@ from pathlib import Path
 def build_runtime(root: Path, opencode: Path) -> None:
     if not opencode.is_file() or not os.access(opencode, os.X_OK):
         raise ValueError("Supply an existing trusted standalone OpenCode executable")
+    python = Path(sys.executable).resolve()
+    stdlib = Path(sysconfig.get_path("stdlib")).resolve()
+    # Keep Python's installation prefix and $ORIGIN loader paths intact. Merely
+    # moving a /usr/local Python into /usr/bin breaks its stdlib/shared library
+    # discovery. Do not place the installation underneath private sandbox mounts.
+    shadowed = {"home", "tmp", "proc", "dev", "workspace", "control"}
+    if any(len(path.parts) < 2 or path.parts[1] in shadowed for path in (python, stdlib)):
+        raise ValueError("Python installation is hidden by sandbox mounts; use a system Python under /usr or /usr/local")
     root.mkdir(mode=0o700, parents=True, exist_ok=False)
     copied = set()
 
@@ -40,10 +48,13 @@ def build_runtime(root: Path, opencode: Path) -> None:
                 copied.add(name)
                 copy(Path(name))
 
-    python = Path(sys.executable).resolve()
-    copy(python, Path("/usr/bin/python3"))
+    copy(python)
+    alias = root / "usr/bin/python3"
+    installed_python = root / python.relative_to("/")
+    if alias != installed_python:
+        alias.parent.mkdir(parents=True, exist_ok=True)
+        alias.symlink_to(os.path.relpath(installed_python, alias.parent))
     libraries(python)
-    stdlib = Path(sysconfig.get_path("stdlib"))
     destination = root / stdlib.relative_to("/")
     shutil.copytree(stdlib, destination, ignore=shutil.ignore_patterns(
         "site-packages", "dist-packages", "__pycache__", "test", "tests", "ensurepip", "idlelib", "tkinter"))
@@ -57,7 +68,8 @@ def build_runtime(root: Path, opencode: Path) -> None:
     (root / "etc/passwd").write_text("agent:x:65534:65534:Coder:/home/agent:/nonexistent\n")
     (root / "etc/group").write_text("agent:x:65534:\n")
     (root / "runtime-manifest.json").write_text(json.dumps({
-        "python": sys.version, "opencode_source": str(opencode),
+        "python": sys.version, "python_executable": str(python),
+        "python_stdlib": str(stdlib), "opencode_source": str(opencode),
         "note": "Built from trusted local files; validate CLI with isolated preflight",
     }, indent=2))
 
