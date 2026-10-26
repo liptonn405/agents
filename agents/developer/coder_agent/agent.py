@@ -21,39 +21,63 @@ class CoderAgent:
         self.config = config
         self.repository, runs, _ = config.host_paths()
         self.reports = ReportStore(runs)
-        # Injection is a trusted Python integration seam, not exposed to JSON/CLI.
-        # Custom engines must supply the same isolation guarantees themselves.
+        # Only trusted Python integrations may replace the isolated engine.
         self.engine = engine if engine is not None else OpenCodeEngine(config)
 
     def run(self, value: str | bytes | dict | Task) -> Result:
         run_id = uuid.uuid4().hex
         task = None
         directory = None
+        begin_attempted = False
 
-        def finish(status: str, error: str | None = None, changed: list[str] | None = None) -> Result:
-            nonlocal directory
-            if directory is None:
-                directory = self.reports.begin(run_id)
-            artifacts = {"report": f"{run_id}/report"}
-            for name, file in (("log", "engine.log"), ("capabilities", "capabilities.json"),
-                               ("manifest", "manifest.json")):
-                if (directory / file).exists():
-                    artifacts[name] = f"{run_id}/{name}"
-            if status == "COMPLETED":
-                artifacts.update({"patch": f"{run_id}/patch", "files": f"{run_id}/files"})
-            return self.reports.finish(Result(
+        def result(status: str, error: str | None = None, changed: list[str] | None = None,
+                   artifacts: dict[str, str] | None = None) -> Result:
+            return Result(
                 task_id=task.task_id if task else None, workspace_id=task.workspace_id if task else None,
                 attempt=task.attempt if task else None, run_id=run_id, status=status,
                 error=error, changed_files=changed or [], requires_clarification=status == "NEEDS_CLARIFICATION",
-                artifacts=artifacts,
-            ))
+                artifacts=artifacts or {},
+            )
+
+        def storage_failure(exc: Exception) -> Result:
+            # Storage failures cannot reliably be stored in the same location.
+            # Return the full identity and no usable artifacts to the caller;
+            # any existing receipt/evidence is preserved, never removed/retried.
+            return result("BLOCKED", f"Execution/report storage unavailable ({type(exc).__name__}); inspect run {run_id}")
+
+        def begin(key: str | None = None) -> None:
+            nonlocal directory, begin_attempted
+            begin_attempted = True
+            directory = self.reports.begin(run_id, key)
+
+        def finish(status: str, error: str | None = None, changed: list[str] | None = None,
+                   workspace: Workspace | None = None) -> Result:
+            try:
+                if directory is None:
+                    if begin_attempted:
+                        return storage_failure(OSError("Run creation failed"))
+                    begin()
+                artifacts = {"report": f"{run_id}/report"}
+                for name, file in (("log", "engine.log"), ("capabilities", "capabilities.json"),
+                                   ("manifest", "manifest.json")):
+                    if (directory / file).exists():
+                        artifacts[name] = f"{run_id}/{name}"
+                if status == "COMPLETED":
+                    artifacts.update({"patch": f"{run_id}/patch", "files": f"{run_id}/files"})
+                report = result(status, error, changed, artifacts)
+                if status == "COMPLETED":
+                    if workspace is None:
+                        raise Rejected("BLOCKED", "Cannot publish unsealed output")
+                    self.reports.seal(report, workspace)
+                return self.reports.finish(report)
+            except (Rejected, OSError, ValueError, TypeError, KeyError) as exc:
+                return storage_failure(exc)
 
         try:
             if isinstance(value, Task):
                 value = value.model_dump()
             if isinstance(value, (str, bytes)):
                 value = decode_json(value)
-            # Bound Python invocations as well as CLI input.
             if len(json.dumps(value, ensure_ascii=True)) > 65_536:
                 raise ValueError("Task too large")
             task = Task.model_validate(value)
@@ -61,13 +85,20 @@ class CoderAgent:
             return finish("INVALID_INPUT", "Invalid task JSON: check version, required fields, strict types and operations")
 
         digest = hashlib.sha256(json.dumps(task.model_dump(), sort_keys=True).encode()).hexdigest()
+        authority = hashlib.sha256(json.dumps({
+            "repository": str(self.repository), "policy": self.config.policy.model_dump(),
+        }, sort_keys=True).encode()).hexdigest()
         try:
-            with self.reports.lock(operation_key(task)):
-                previous = self.reports.previous(task, digest)
+            # Saved results do not restore permissions revoked by the operator.
+            self.config.policy.authorize(task.read_files, task.allowed_write_files)
+            for instruction in task.instructions:
+                self.config.policy.authorize([], [instruction.file])
+            with self.reports.lock(operation_key(task), owner=run_id):
+                previous = self.reports.previous(task, digest, authority=authority)
                 if previous is not None:
                     return previous
-                directory = self.reports.begin(run_id, operation_key(task))
-                self.reports.claim(task, digest, run_id)
+                begin(operation_key(task))
+                self.reports.claim(task, digest, run_id, authority=authority)
                 try:
                     baseline = validate_plan(task, self.repository, self.config.policy)
                     workspace = Workspace(directory / "workspace", baseline, self.config.policy)
@@ -82,7 +113,6 @@ class CoderAgent:
                     except Rejected as exc:
                         outcome = EngineOutcome(exc.status, str(exc))
                     except Exception as exc:
-                        # Do not echo exception messages containing host paths or credentials.
                         outcome = EngineOutcome("FAILED", f"Engine failure ({type(exc).__name__}); partial edits quarantined")
                     changed, patch = workspace.audit(task.allowed_write_files)
                     for name, source in baseline.items():
@@ -99,14 +129,21 @@ class CoderAgent:
                     if missing:
                         return finish("NEEDS_CLARIFICATION", "No edits for planned files: " + ", ".join(sorted(missing)), changed)
                     (directory / "changes.patch").write_text(patch, encoding="utf-8")
-                    return finish("COMPLETED", changed=changed)
+                    return finish("COMPLETED", changed=changed, workspace=workspace)
                 except Rejected as exc:
                     return finish(exc.status, str(exc))
-                except (OSError, ValueError) as exc:
-                    return finish("FAILED", f"Workspace/report error ({type(exc).__name__})")
+                except (OSError, ValueError, TypeError, KeyError) as exc:
+                    return finish("BLOCKED", f"Workspace/report unavailable ({type(exc).__name__}); partial output quarantined")
         except Rejected as exc:
             return finish(exc.status, str(exc))
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            # Covers lock, receipt, initial state and claim failures as well as
+            # damaged saved results. Never invoke the engine after such errors.
+            return finish("BLOCKED", f"Execution state unavailable ({type(exc).__name__}); do not blindly repeat this attempt")
 
     def status(self, run_id: str) -> dict:
-        """Read-only lifecycle inspection; never restart or resume an edit."""
-        return self.reports.inspect(run_id)
+        """Inspect one execution; never restart or resume an edit."""
+        try:
+            return self.reports.inspect(run_id)
+        except Rejected as exc:
+            return {"run_id": run_id, "state": "BLOCKED", "error": str(exc)}

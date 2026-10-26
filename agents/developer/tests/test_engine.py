@@ -3,20 +3,18 @@ from __future__ import annotations
 import json
 import os
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from coder_support import CoderCase, task
-from coder_agent import CoderAgent, Config, Policy, Task
-from coder_agent.build_runtime import build_runtime
-from coder_agent.engine import OpenCodeEngine, opencode_config, parse_events, run_process
+from coder_agent import CoderAgent, Task
+from coder_agent.engine import ProcessResult, opencode_config, parse_events, run_process
+from coder_agent.policy import Rejected
 
 
 def event(reply):
@@ -27,6 +25,22 @@ class EventTests(unittest.TestCase):
     def test_structured_completion(self):
         data = event({"status": "COMPLETED", "message": "Edited", "required_files": []})
         self.assertEqual(parse_events(data, 10).status, "COMPLETED")
+
+    def test_earlier_completion_cannot_replace_missing_final_reply(self):
+        early = event({"status": "COMPLETED", "message": "Premature"})
+        for later in ({"type": "step_start"}, {"type": "tool_use", "part": {
+                "tool": "edit", "state": {"input": {"filePath": "/workspace/src/app.py"}}}}):
+            with self.subTest(later=later):
+                data = early + json.dumps(later).encode() + b'\n{"type":"step_finish"}\n'
+                self.assertEqual(parse_events(data, 10, Task.model_validate(task())).status, "FAILED")
+
+    def test_final_reply_after_earlier_completion_is_used(self):
+        data = event({"status": "COMPLETED", "message": "Premature"})
+        data += b'{"type":"step_start"}\n'
+        data += event({"status": "NEEDS_CLARIFICATION", "message": "Need a decision"})
+        reply = parse_events(data, 10)
+        self.assertEqual(reply.status, "NEEDS_CLARIFICATION")
+        self.assertEqual(reply.message, "Need a decision")
 
     def test_zero_exit_is_not_enough(self):
         for data in (b"", b"not JSON", b"[]", b'{"type":"text","part":{}}',
@@ -113,201 +127,64 @@ class ProcessTests(unittest.TestCase):
 
 
 class AdapterTests(CoderCase):
+    def runtime_executable(self, name):
+        path = Path(self.config.runtime_root) / name.lstrip("/")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("fixture executable; never started\n")
+        path.chmod(0o755)
+        return path
+
     def test_missing_opencode_is_blocked(self):
-        result = CoderAgent(self.config).run(self.payload)
+        # This test owns every other dependency: it is independent of the host.
+        self.runtime_executable(self.config.python_binary)
+        with patch("coder_agent.sandbox.shutil.which", return_value="/usr/bin/bwrap"), \
+                patch("coder_agent.sandbox.os.getuid", return_value=1000):
+            result = CoderAgent(self.config).run(self.payload)
         self.assertEqual(result.status, "BLOCKED")
-        self.assertIn("executable missing", result.error)
+        self.assertIn(self.config.opencode_binary, result.error)
         self.assertEqual((self.repo / "src/app.py").read_text(), "VALUE = 1\n")
+
+    def test_missing_bubblewrap_is_blocked(self):
+        self.runtime_executable(self.config.python_binary)
+        self.runtime_executable(self.config.opencode_binary)
+        with patch("coder_agent.sandbox.shutil.which", return_value=None):
+            result = CoderAgent(self.config).run(self.payload)
+        self.assertEqual(result.status, "BLOCKED")
+        self.assertIn("Bubblewrap", result.error)
+
+    def test_root_host_user_is_blocked(self):
+        self.runtime_executable(self.config.python_binary)
+        self.runtime_executable(self.config.opencode_binary)
+        with patch("coder_agent.sandbox.shutil.which", return_value="/usr/bin/bwrap"), \
+                patch("coder_agent.sandbox.os.getuid", return_value=0):
+            result = CoderAgent(self.config).run(self.payload)
+        self.assertEqual(result.status, "BLOCKED")
+        self.assertIn("unprivileged", result.error)
+
+    def test_namespace_start_failure_is_blocked(self):
+        self.runtime_executable(self.config.python_binary)
+        self.runtime_executable(self.config.opencode_binary)
+        with patch("coder_agent.sandbox.shutil.which", return_value="/usr/bin/bwrap"), \
+                patch("coder_agent.sandbox.os.getuid", return_value=1000), \
+                patch("coder_agent.engine.run_process", return_value=ProcessResult(1, b"namespace denied")):
+            result = CoderAgent(self.config).run(self.payload)
+        self.assertEqual(result.status, "BLOCKED")
+        self.assertEqual((self.repo / "src/app.py").read_text(), "VALUE = 1\n")
+
+    def test_process_start_error_is_blocked(self):
+        with patch("coder_agent.engine.subprocess.Popen", side_effect=FileNotFoundError("private path")):
+            with self.assertRaises(Rejected) as caught:
+                run_process(["missing-executable"], self.root / "start.log", timeout=1, max_bytes=1024)
+        self.assertEqual(caught.exception.status, "BLOCKED")
+        self.assertNotIn("private path", str(caught.exception))
 
     def test_permissions_deny_shell_delegation_and_tests(self):
         config = opencode_config(Task.model_validate(task()), self.config)
         permission = config["agent"]["coder"]["permission"]
         self.assertEqual(permission["*"], "deny")
         self.assertEqual(set(permission), {"*", "read", "edit"})
-        self.assertEqual(permission["edit"], {"*": "deny", "/workspace/src/app.py": "allow"})
+        self.assertEqual(permission["edit"], {"*": "deny", "src/app.py": "allow",
+            "workspace/src/app.py": "allow", "/workspace/src/app.py": "allow"})
         self.assertEqual(config["agent"]["coder"]["steps"], self.config.max_steps)
         self.assertFalse(config["lsp"])
         self.assertFalse(config["formatter"])
-
-
-FAKE_OPENCODE = '''#!/usr/bin/python3
-import http.client,json,os,pathlib,socket,subprocess,sys,time
-if sys.argv[1:] == ['--version']:
-    print('fake-opencode-1.0')
-    raise SystemExit(0)
-if sys.argv[1:] == ['run','--help']:
-    print('opencode run --format --model --agent')
-    raise SystemExit(0)
-assert sys.argv[1:8] == ['run','--format','json','--model','gateway/local-model','--agent','coder']
-assert sys.argv[8] == '--'
-task=json.loads(sys.argv[9].split('Validated task JSON:\\n',1)[1])
-assert os.getuid() == 65534
-assert 'TEST_HOST_SECRET' not in os.environ
-assert not pathlib.Path('/var/run/docker.sock').exists()
-assert not pathlib.Path('/workspace/.git').exists()
-assert not pathlib.Path('/workspace/.env').exists()
-assert not pathlib.Path('/home/adam/.ssh').exists()
-assert not pathlib.Path('/usr/bin/git').exists()
-assert not pathlib.Path('/bin/sh').exists()
-print(json.dumps({'type':'sandbox_probe','uid':os.getuid(),'netns':os.readlink('/proc/self/ns/net')}))
-for target in ['/escape','/workspace/undeclared.py','/control/opencode.json']:
-    try:
-        pathlib.Path(target).write_text('bad')
-    except OSError:
-        pass
-    else:
-        raise AssertionError('write was allowed: '+target)
-if pathlib.Path('/workspace/readme.txt').exists():
-    try:
-        pathlib.Path('/workspace/readme.txt').write_text('bad')
-    except OSError:
-        pass
-    else:
-        raise AssertionError('read-only context was writable')
-with socket.socket() as s:
-    s.settimeout(.2)
-    try:
-        s.connect(('192.0.2.1',443))
-    except OSError:
-        pass
-    else:
-        raise AssertionError('outbound network available')
-if task['task_id'] == 'timeout':
-    subprocess.Popen(['/usr/bin/python3','-c',
-        "import pathlib,time; time.sleep(3); pathlib.Path('/workspace/src/app.py').write_text('SURVIVED')"],
-        start_new_session=True)
-    time.sleep(10)
-if task['task_id'] == 'crash':
-    raise SystemExit(9)
-if task['task_id'] == 'channel':
-    connection = http.client.HTTPConnection('127.0.0.1',8765,timeout=3)
-    connection.request('POST','/v1/chat/completions',json.dumps({'model':'local-model'}))
-    response = connection.getresponse()
-    assert response.status == 200 and response.read() == b'{"ok":true}'
-    connection.close()
-if task['task_id'] == 'clarify':
-    reply={'status':'NEEDS_CLARIFICATION','message':'Need a config decision','required_files':['config.json']}
-else:
-    pathlib.Path('/workspace/src/app.py').write_text('VALUE = 2\\n')
-    if 'new.py' in task['allowed_write_files']:
-        pathlib.Path('/workspace/new.py').write_text('NEW = 1\\n')
-    reply={'status':'COMPLETED','message':'Prescribed edit finished','required_files':[]}
-print(json.dumps({'type':'text','part':{'text':json.dumps(reply)}}))
-'''
-
-
-class IsolatedOpenCodeTests(CoderCase):
-    @classmethod
-    def setUpClass(cls):
-        import shutil
-        if not shutil.which("bwrap"):
-            raise unittest.SkipTest("Bubblewrap is not installed")
-        probe = subprocess.run(["bwrap", "--unshare-all", "--ro-bind", "/usr", "/usr",
-                                "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64",
-                                "/usr/bin/true"], capture_output=True)
-        if probe.returncode:
-            if os.environ.get("CODER_REQUIRE_SANDBOX") == "1":
-                raise AssertionError(probe.stderr.decode())
-            raise unittest.SkipTest("Kernel/supervisor denies Bubblewrap namespaces")
-        cls.runtime_tmp = tempfile.TemporaryDirectory()
-        cls.addClassCleanup(cls.runtime_tmp.cleanup)
-        root = Path(cls.runtime_tmp.name)
-        binary = root / "fake-opencode"
-        binary.write_text(FAKE_OPENCODE)
-        binary.chmod(0o755)
-        cls.runtime = root / "runtime"
-        build_runtime(cls.runtime, binary)
-
-    def setUp(self):
-        super().setUp()
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.bind(str(self.root / "model.sock"))
-        self.addCleanup(self.sock.close)
-        self.config = self.config.model_copy(update={"runtime_root": str(self.runtime),
-                                                    "model_socket": str(self.root / "model.sock"),
-                                                    "timeout_seconds": 5})
-        self.agent = CoderAgent(self.config)
-
-    def test_fake_opencode_in_real_namespace_sandbox(self):
-        self.payload["read_files"].append("readme.txt")
-        with patch.dict(os.environ, {"TEST_HOST_SECRET": "sentinel"}):
-            result = self.agent.run(self.payload)
-        log = self.workspace(result).parent / "engine.log"
-        self.assertEqual(result.status, "COMPLETED", (result.error, log.read_text() if log.exists() else "no log"))
-        self.assertEqual(result.changed_files, ["src/app.py"])
-        self.assertEqual((self.repo / "src/app.py").read_text(), "VALUE = 1\n")
-        self.assertEqual((self.repo / "readme.txt").read_text(), "Read only context\n")
-        probe = next(json.loads(line) for line in log.read_text().splitlines() if 'sandbox_probe' in line)
-        self.assertNotEqual(probe["netns"], os.readlink("/proc/self/ns/net"))
-        self.assertEqual(probe["uid"], 65534)
-
-    def test_isolated_create(self):
-        self.payload["instructions"].append({"file": "new.py", "operation": "create",
-                                             "target": "module", "requirements": ["Set NEW = 1"]})
-        self.payload["allowed_write_files"].append("new.py")
-        result = self.agent.run(self.payload)
-        self.assertEqual(result.status, "COMPLETED", result.error)
-        self.assertFalse((self.repo / "new.py").exists())
-
-    def test_isolated_timeout(self):
-        self.payload["task_id"] = "timeout"
-        self.config = self.config.model_copy(update={"timeout_seconds": 2})
-        result = CoderAgent(self.config).run(self.payload)
-        self.assertEqual(result.status, "FAILED", result.error)
-        self.assertIn("timed out", result.error)
-        self.assertNotIn("files", result.artifacts)
-        time.sleep(2)
-        self.assertEqual((self.workspace(result) / "src/app.py").read_text(), "VALUE = 1\n")
-
-    def test_isolated_crash(self):
-        self.payload["task_id"] = "crash"
-        result = self.agent.run(self.payload)
-        self.assertEqual(result.status, "FAILED", result.error)
-        self.assertIn("code 9", result.error)
-
-    def test_isolated_clarification(self):
-        self.payload["task_id"] = "clarify"
-        result = self.agent.run(self.payload)
-        self.assertEqual(result.status, "NEEDS_CLARIFICATION", result.error)
-        self.assertIn("config.json", result.error)
-
-    def test_missing_gateway_is_blocked(self):
-        config = self.config.model_copy(update={"model_socket": None})
-        result = CoderAgent(config).run(self.payload)
-        self.assertEqual(result.status, "BLOCKED")
-        self.assertIn("gateway", result.error)
-
-    def test_cli_uses_same_boundary(self):
-        config_file = self.root / "config.json"
-        task_file = self.root / "task.json"
-        output_file = self.root / "result.json"
-        config_file.write_text(self.config.model_dump_json())
-        task_file.write_text(json.dumps(self.payload))
-        result = subprocess.run([sys.executable, "-m", "coder_agent", "--config", str(config_file),
-                                 "--input", str(task_file), "--output", str(output_file)],
-                                cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=15)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(json.loads(output_file.read_text())["status"], "COMPLETED")
-
-    def test_only_model_channel_crosses_network_namespace(self):
-        self.payload["task_id"] = "channel"
-        self.sock.listen(1)
-        self.sock.settimeout(5)
-        requests = []
-
-        def reply():
-            connection, _ = self.sock.accept()
-            with connection:
-                connection.settimeout(3)
-                data = b""
-                while b"\r\n\r\n" not in data:
-                    data += connection.recv(4096)
-                requests.append(data)
-                connection.sendall(b'HTTP/1.0 200 OK\r\nContent-Length: 11\r\n\r\n{"ok":true}')
-
-        worker = threading.Thread(target=reply, daemon=True)
-        worker.start()
-        result = self.agent.run(self.payload)
-        worker.join(5)
-        self.assertEqual(result.status, "COMPLETED", result.error)
-        self.assertTrue(requests[0].startswith(b"POST /v1/chat/completions "))

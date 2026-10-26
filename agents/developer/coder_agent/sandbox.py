@@ -61,7 +61,8 @@ class BubblewrapSandbox:
             command += ["--setenv", key, value]
         return [*command, "--chdir", "/workspace", config.python_binary, "-I", "-B",
                 "/control/bootstrap.py", str(config.cpu_seconds), str(config.process_limit),
-                str(max(config.policy.max_file_bytes, 33_554_432)), *argv]
+                str(max(config.policy.max_file_bytes, 33_554_432)),
+                str(min(config.model_request_timeout_seconds, config.timeout_seconds)), *argv]
 
     def prepare_control(self, control: Path, opencode_config: dict) -> None:
         control.mkdir(mode=0o700)

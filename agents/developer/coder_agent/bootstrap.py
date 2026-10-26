@@ -6,6 +6,7 @@ shell, credentials or configurable destinations are available here.
 from __future__ import annotations
 
 import os
+import math
 import resource
 import select
 import socket
@@ -18,12 +19,12 @@ import threading
 class Bridge(socketserver.BaseRequestHandler):
     def handle(self):
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as upstream:
-            upstream.settimeout(60)
+            upstream.settimeout(self.server.upstream_timeout)
             try:
                 upstream.connect("/tmp/model.sock")
                 sockets = (self.request, upstream)
                 while True:
-                    ready, _, _ = select.select(sockets, [], [], 60)
+                    ready, _, _ = select.select(sockets, [], [], self.server.upstream_timeout)
                     if not ready:
                         return
                     for source in ready:
@@ -38,10 +39,14 @@ class Bridge(socketserver.BaseRequestHandler):
 class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
     allow_reuse_address = True
+    upstream_timeout = 60
 
 
 def main():
     cpu, processes, file_bytes = map(int, sys.argv[1:4])
+    upstream_timeout = float(sys.argv[4])
+    if not math.isfinite(upstream_timeout) or not 0 < upstream_timeout <= 7200:
+        return 125
     for kind, value in ((resource.RLIMIT_CPU, cpu), (resource.RLIMIT_NPROC, processes),
                         (resource.RLIMIT_FSIZE, file_bytes), (resource.RLIMIT_NOFILE, 256),
                         (resource.RLIMIT_CORE, 0)):
@@ -50,8 +55,9 @@ def main():
         return 125
     if os.path.exists("/tmp/model.sock"):
         server = Server(("127.0.0.1", 8765), Bridge)
+        server.upstream_timeout = upstream_timeout
         threading.Thread(target=server.serve_forever, daemon=True).start()
-    return subprocess.call(sys.argv[4:], stdin=subprocess.DEVNULL)
+    return subprocess.call(sys.argv[5:], stdin=subprocess.DEVNULL)
 
 
 if __name__ == "__main__":

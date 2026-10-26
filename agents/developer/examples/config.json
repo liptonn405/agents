@@ -4,6 +4,8 @@
   "runtime_root": "/srv/coder-runtime",
   "model_socket": "/srv/coder-gateway/model.sock",
   "model": "local-model",
+  "model_context_tokens": 131072,
+  "model_output_tokens": 8192,
   "timeout_seconds": 600,
   "max_steps": 20,
   "policy": {
