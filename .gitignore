@@ -11,3 +11,8 @@ venv/
 *.log
 *.key
 *.pem
+
+# Python build artifacts
+*.egg-info/
+build/
+dist/

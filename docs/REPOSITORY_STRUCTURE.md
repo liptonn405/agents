@@ -36,4 +36,5 @@ docs/             # Документация для команды
 Из корня репозитория:
 
 - `make check` — проверка структуры; если DeveloperAgent присутствует, также его unit-тесты.
+- `make test-analyst` — запуск unit-тестов AnalystAgent.
 - `make test-developer` — запуск unit-тестов DeveloperAgent (после его появления в текущей ветке).

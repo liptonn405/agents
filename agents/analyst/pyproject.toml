@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "miminet-analyst-agent"
+version = "0.1.0"
+description = "Architect artifact -> validated CoderAgent task"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.12,<3",
+    "chromadb>=0.5,<2",
+    "openai>=1.40,<3",
+]
+
+[project.scripts]
+analyst-agent = "analyst_agent.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["analyst_agent*"]
