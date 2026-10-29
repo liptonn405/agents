@@ -45,7 +45,8 @@ SYSTEM_PROMPT = """Ты — AnalystAgent в конвейере разработ�
   "acceptance_criteria": ["проверяемый критерий готовности"],
   "test_plan": ["что проверить Тестировщику"],
   "risks": ["риск или ограничение"],
-  "open_questions": ["вопрос, если данных не хватает"]
+  "open_questions": ["необязательный вопрос, который не блокирует работу"],
+  "blocking_questions": ["вопрос, без ответа на который задание выполнить нельзя"]
 }
 
 Правила:
@@ -53,10 +54,12 @@ SYSTEM_PROMPT = """Ты — AnalystAgent в конвейере разработ�
 2. Для operation="create" файла ещё не должно существовать; родительский каталог должен быть реальным.
 3. requirements — массив ТЕКСТОВЫХ строк с описанием изменений, а не массив чисел.
 4. requirement_refs — массив целых индексов требований Архитектора (с нуля). Каждое требование должно быть покрыто хотя бы одним instruction.
-5. Не выдумывай поля моделей, методы, маршруты и шаблоны. Если чего-то нет в коде — вынеси это в open_questions.
-6. Сохраняй стиль проекта: Flask, SQLAlchemy, Jinja2.
-7. Не предлагай изменять секреты, .env, .git, .ssh, конфигурации OpenCode и служебные файлы.
-8. target и requirements должны быть конкретными и проверяемыми.
+5. Не выдумывай поля моделей, методы, маршруты и шаблоны. Если чего-то нет в коде — задай вопрос.
+6. Если без ответа на вопрос задание нельзя выполнить (например, в модели нет нужного поля, нет метода или неясна схема данных), помести вопрос в blocking_questions. Это переведёт артефакт в статус NEEDS_CLARIFICATION, и Кодер его не получит.
+7. Если вопрос не блокирует реализацию (формат даты, косметика, необязательный сценарий), помести его в open_questions.
+8. Сохраняй стиль проекта: Flask, SQLAlchemy, Jinja2.
+9. Не предлагай изменять секреты, .env, .git, .ssh, конфигурации OpenCode и служебные файлы.
+10. target и requirements должны быть конкретными и проверяемыми.
 """
 
 
@@ -423,11 +426,12 @@ class AnalystAgent:
             ]
 
         allowed_write_files = list(dict.fromkeys(item.file for item in instructions))
-        read_files = list(
-            dict.fromkeys(
-                item.file for item in instructions if item.operation == "modify"
-            )
-        )
+        # Кодер читает только read_files, поэтому в список чтения попадают и
+        # файлы-задания, и найденный контекст (например, модель Network).
+        # Записывать контекстные файлы нельзя: их нет в allowed_write_files.
+        modify_files = [item.file for item in instructions if item.operation == "modify"]
+        read_candidates = [*modify_files, *(snippet.file_path for snippet in snippets)]
+        read_files = list(dict.fromkeys(read_candidates))[:100]
         resolved_task_id = self._task_id(task_id or artifact.artifact_id)
         resolved_workspace_id = self._workspace_id(
             workspace_id or f"ws-{resolved_task_id}"
@@ -451,10 +455,11 @@ class AnalystAgent:
             )
             for index, requirement in enumerate(artifact.requirements)
         ]
+        blocking_questions = list(draft.blocking_questions)
         report = AnalystReport(
             artifact_id=self._artifact_id(f"analyst-{resolved_task_id}"),
             source_artifact_id=artifact.artifact_id,
-            status="READY",
+            status="NEEDS_CLARIFICATION" if blocking_questions else "READY",
             goal=artifact.goal,
             scope_in=list(artifact.requirements),
             scope_out=list(artifact.non_goals),
@@ -470,6 +475,7 @@ class AnalystAgent:
             risks=draft.risks
             or ["План основан на ограниченном контексте Code RAG."],
             open_questions=draft.open_questions,
+            blocking_questions=blocking_questions,
             traceability=traceability,
             context_files=list(dict.fromkeys(s.file_path for s in snippets)),
         )

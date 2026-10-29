@@ -96,6 +96,13 @@ def main(argv: list[str] | None = None) -> int:
             output.model_dump(mode="json"), ensure_ascii=False, indent=2
         ) + "\n"
 
+        if output.report.status == "NEEDS_CLARIFICATION":
+            # Блокирующие вопросы: задание Кодеру не выдаём, возвращаем отчёт.
+            if args.report:
+                _write_new(args.report, report_payload, agent.index.repo_path)
+            print(report_payload, end="", file=sys.stderr)
+            return 1
+
         if args.bundle:
             print(bundle_payload, end="")
         elif args.output:

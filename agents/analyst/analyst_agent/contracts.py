@@ -109,6 +109,9 @@ class AnalystDraft(StrictModel):
     open_questions: Annotated[list[Text], Field(max_length=100)] = Field(
         default_factory=list
     )
+    blocking_questions: Annotated[list[Text], Field(max_length=100)] = Field(
+        default_factory=list
+    )
 
 
 class TraceLink(StrictModel):
@@ -131,6 +134,7 @@ class AnalystReport(StrictModel):
     test_plan: Annotated[list[Text], Field(max_length=100)]
     risks: Annotated[list[Text], Field(max_length=100)]
     open_questions: Annotated[list[Text], Field(max_length=100)]
+    blocking_questions: Annotated[list[Text], Field(max_length=100)]
     traceability: Annotated[list[TraceLink], Field(max_length=100)]
     context_files: Annotated[list[PathText], Field(max_length=100)]
 

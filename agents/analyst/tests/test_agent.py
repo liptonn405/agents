@@ -83,11 +83,10 @@ class OfflineAgentTests(unittest.TestCase):
                 set(task.allowed_write_files),
                 {item.file for item in task.instructions},
             )
-            self.assertTrue(
-                set(task.read_files).issubset(set(task.allowed_write_files))
-            )
             for item in task.instructions:
                 self.assertTrue((repo / item.file).is_file())
+                if item.operation == "modify":
+                    self.assertIn(item.file, task.read_files)
 
             report = output.report
             self.assertEqual(report.status, "READY")
@@ -95,6 +94,10 @@ class OfflineAgentTests(unittest.TestCase):
             self.assertEqual(len(report.traceability), 3)
             self.assertTrue(all(link.files for link in report.traceability))
             self.assertTrue(report.context_files)
+            self.assertTrue(
+                set(report.context_files).issubset(set(task.read_files))
+            )
+            self.assertEqual(report.blocking_questions, [])
 
 
     def test_parse_draft_repairs_integer_requirements(self) -> None:
@@ -156,6 +159,44 @@ class OfflineAgentTests(unittest.TestCase):
             )
             self.assertIn("Первая часть", output.task.instructions[0].target)
             self.assertIn("Вторая часть", output.task.instructions[0].target)
+
+    def test_blocking_questions_mark_report_needs_clarification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = make_repo(Path(tmp))
+            agent = AnalystAgent(repo_path=repo, offline=True)
+            snippets = [
+                ContextSnippet(
+                    file_path="front/src/miminet_auth.py",
+                    content="def user_profile(): pass",
+                    relevance=1.0,
+                )
+            ]
+            draft = AnalystDraft(
+                instructions=[
+                    DraftInstruction(
+                        file="front/src/miminet_auth.py",
+                        operation="modify",
+                        target="user_profile",
+                        requirements=["Всё"],
+                        requirement_refs=[0, 1, 2],
+                    )
+                ],
+                acceptance_criteria=["Готово"],
+                blocking_questions=["В модели нет поля с датой создания"],
+            )
+            output = agent._build_output(
+                artifact(),
+                draft,
+                snippets,
+                task_id=None,
+                workspace_id=None,
+                attempt=1,
+            )
+            self.assertEqual(output.report.status, "NEEDS_CLARIFICATION")
+            self.assertEqual(
+                output.report.blocking_questions,
+                ["В модели нет поля с датой создания"],
+            )
 
     def test_rejects_uncovered_requirement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
