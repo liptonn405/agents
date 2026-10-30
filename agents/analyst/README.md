@@ -119,8 +119,16 @@ python3 -m venv .venv
 ```
 
 `--output` определяет формат по расширению: `.md` — Markdown, `.json` — строгий
-`CoderTask`. `--task-json` всегда пишет JSON для CoderAgent. Без `--output`
-результат печатается в stdout в Markdown (или JSON при `--format json`).
+`CoderTask`. `--task-json` всегда пишет JSON для CoderAgent.
+
+Если не указывать `--output`, `--report`, `--task-json` и `--bundle`, результаты
+автоматически сохраняются в каталог `sem2/analyst_artifacts/`:
+
+- `plan-<artifact_id>-<timestamp>.md` — Markdown-артефакт;
+- `report-<artifact_id>-<timestamp>.md` — отчёт;
+- `task-<artifact_id>-<timestamp>.json` — задание Кодеру (только при `READY`).
+
+Каталог можно изменить через `--output-dir` или `ANALYST_OUTPUT_DIR`.
 `--bundle` выводит task и report одним JSON. `--offline` не требует API-ключа
 и использует детерминированный план.
 

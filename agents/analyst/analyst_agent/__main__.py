@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -44,6 +45,25 @@ def _infer_format(path: Path | None, fallback: str) -> str:
     return fallback
 
 
+def _default_output_dir() -> Path:
+    explicit = os.getenv("ANALYST_OUTPUT_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+
+    for parent in Path(__file__).resolve().parents:
+        if parent.name == "sem2":
+            return parent / "analyst_artifacts"
+    if (Path.cwd().parent / "miminet").is_dir():
+        return Path.cwd().parent / "analyst_artifacts"
+    return Path.cwd() / "analyst_artifacts"
+
+
+def _ensure_output_dir(path: Path) -> Path:
+    target = path.expanduser().resolve()
+    target.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return target
+
+
 def _write_new(path: Path, payload: str, repo: Path) -> None:
     target = path.expanduser().resolve()
     root = repo.resolve()
@@ -73,6 +93,14 @@ def main(argv: list[str] | None = None) -> int:
         "--output",
         type=Path,
         help="Куда записать артефакт: .md — Markdown, .json — строгий CoderTask",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help=(
+            "Каталог автосохранения, если не заданы --output/--report/--task-json "
+            "(по умолчанию sem2/analyst_artifacts)"
+        ),
     )
     parser.add_argument(
         "--report",
@@ -143,8 +171,31 @@ def main(argv: list[str] | None = None) -> int:
         ) + "\n"
         markdown_payload = render_analyst_markdown(output)
 
+        auto_save = not (
+            args.output or args.report or args.task_json or args.bundle
+        )
+        auto_paths: dict[str, Path] = {}
+        if auto_save:
+            out_dir = _ensure_output_dir(args.output_dir or _default_output_dir())
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            artifact_id = output.report.artifact_id
+            auto_paths = {
+                "plan": out_dir / f"plan-{artifact_id}-{stamp}.md",
+                "report": out_dir / f"report-{artifact_id}-{stamp}.md",
+                "task": out_dir / f"task-{artifact_id}-{stamp}.json",
+            }
+
         if output.report.status == "NEEDS_CLARIFICATION":
             # Блокирующие вопросы: задание Кодеру не выдаём, возвращаем отчёт.
+            if auto_save:
+                _write_new(
+                    auto_paths["plan"], markdown_payload, agent.index.repo_path
+                )
+                _write_new(
+                    auto_paths["report"], markdown_payload, agent.index.repo_path
+                )
+                print(f"План: {auto_paths['plan']}", file=sys.stderr)
+                print(f"Отчёт: {auto_paths['report']}", file=sys.stderr)
             if args.output:
                 payload = (
                     markdown_payload
@@ -159,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
                     else report_payload
                 )
                 _write_new(args.report, payload, agent.index.repo_path)
-            if not args.output and not args.report:
+            if not args.output and not args.report and not auto_save:
                 print(markdown_payload, end="", file=sys.stderr)
             return 1
 
@@ -172,6 +223,13 @@ def main(argv: list[str] | None = None) -> int:
                 else task_payload
             )
             _write_new(args.output, payload, agent.index.repo_path)
+        elif auto_save:
+            _write_new(auto_paths["plan"], markdown_payload, agent.index.repo_path)
+            _write_new(auto_paths["report"], markdown_payload, agent.index.repo_path)
+            _write_new(auto_paths["task"], task_payload, agent.index.repo_path)
+            print(f"План: {auto_paths['plan']}", file=sys.stderr)
+            print(f"Отчёт: {auto_paths['report']}", file=sys.stderr)
+            print(f"Задание: {auto_paths['task']}", file=sys.stderr)
         else:
             payload = markdown_payload if (args.format or "md") == "md" else task_payload
             print(payload, end="")

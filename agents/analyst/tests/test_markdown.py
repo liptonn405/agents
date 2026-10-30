@@ -119,6 +119,35 @@ class MarkdownCliTests(unittest.TestCase):
             )
             self.assertEqual(task.schema_version, "1.0")
 
+    def test_autosave_to_output_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as out_tmp:
+            repo = make_repo(Path(repo_tmp))
+            artifact_path = Path(out_tmp) / "architect.md"
+            artifact_path.write_text(MARKDOWN, encoding="utf-8")
+            output_dir = Path(out_tmp) / "saved"
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                code = main(
+                    [
+                        "--artifact", str(artifact_path),
+                        "--repo", str(repo),
+                        "--offline",
+                        "--output-dir", str(output_dir),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            plans = list(output_dir.glob("plan-*.md"))
+            reports = list(output_dir.glob("report-*.md"))
+            tasks = list(output_dir.glob("task-*.json"))
+            self.assertEqual(len(plans), 1)
+            self.assertEqual(len(reports), 1)
+            self.assertEqual(len(tasks), 1)
+            self.assertIn("# Артефакт AnalystAgent", plans[0].read_text(encoding="utf-8"))
+            task = CoderTask.model_validate(
+                json.loads(tasks[0].read_text(encoding="utf-8"))
+            )
+            self.assertEqual(task.schema_version, "1.0")
+
 
 if __name__ == "__main__":
     unittest.main()
