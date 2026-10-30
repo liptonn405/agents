@@ -24,29 +24,49 @@ CoderAgent
 
 ## Входной артефакт
 
-Пример: `examples/architect_artifact.json`.
+Основной формат — **Markdown**. Пример: `examples/architect_artifact.md`.
 
-```json
-{
-  "schema_version": "1.0",
-  "artifact_id": "arch-001",
-  "goal": "Что нужно сделать",
-  "requirements": ["Проверяемое требование"],
-  "acceptance_criteria": ["Критерий готовности"],
-  "constraints": ["Ограничение"],
-  "affected_areas": ["Затронутая область"],
-  "non_goals": ["Что не входит в задачу"],
-  "context": "Необязательные заметки",
-  "issue": {"title": "Заголовок", "body": "Описание"}
-}
+```markdown
+# Артефакт Архитектора
+
+artifact_id: arch-001
+
+## Цель
+
+Добавить в профиль пользователя статистику по созданным сетям.
+
+## Требования
+
+- Показывать количество сетей пользователя.
+- Показывать дату последней созданной сети.
+
+## Критерии готовности
+
+- Статистика видна на странице профиля.
+
+## Ограничения
+
+- Не дублировать запросы к БД.
 ```
 
-Обязательные поля: `schema_version`, `artifact_id`, `goal`, `requirements`.
-Остальные поля необязательны. Лишние поля и нестрогие типы отклоняются.
+Поддерживаемые разделы: «Цель», «Требования», «Критерии готовности»,
+«Ограничения», «Вне рамок», «Затронутые компоненты», «Контекст», «Issue».
+`artifact_id` можно указать строкой `artifact_id: ...`. Если разделов нет,
+агент разбирает свободный текст и берёт требования из списка или предложений.
+
+JSON-артефакт (`examples/architect_artifact.json`) остаётся для обратной
+совместимости и автотестов.
+
+## Выходной артефакт
+
+Основной формат — тоже Markdown: человекочитаемый план со встроенным блоком
+`CoderTask` в ```json. CoderAgent по-прежнему требует строгий JSON, поэтому
+для него можно отдельно сохранить `--task-json task.json` или использовать
+`--output task.json`.
 
 ## Что делает агент
 
-1. Проверяет схему артефакта Архитектора.
+1. Парсит Markdown (или JSON) и проверяет артефакт Архитектора.
 2. Индексирует `front/src` и `back/src` репозитория Miminet.
 3. Ищет код через гибридный Code RAG: хеш-эмбеддинги + IDF + совпадения путей
    + русско-английские подсказки + определения явно упомянутых классов/функций.
@@ -88,16 +108,21 @@ python3 -m venv .venv
 ## Запуск
 
 ```bash
+# Markdown-артефакт для человека + JSON-задание для CoderAgent
 .venv/bin/python -m analyst_agent \
-  --artifact agents/analyst/examples/architect_artifact.json \
+  --artifact agents/analyst/examples/architect_artifact.md \
   --repo ../miminet \
-  --output /tmp/coder-task.json \
-  --report /tmp/analyst-report.json \
+  --output /tmp/analyst-plan.md \
+  --task-json /tmp/coder-task.json \
+  --report /tmp/analyst-report.md \
   --offline
 ```
 
-Без `--output` задание печатается в stdout. `--bundle` выводит task и report
-одним JSON. `--offline` не требует API-ключа и использует детерминированный план.
+`--output` определяет формат по расширению: `.md` — Markdown, `.json` — строгий
+`CoderTask`. `--task-json` всегда пишет JSON для CoderAgent. Без `--output`
+результат печатается в stdout в Markdown (или JSON при `--format json`).
+`--bundle` выводит task и report одним JSON. `--offline` не требует API-ключа
+и использует детерминированный план.
 
 ## Настройки LLM
 

@@ -12,13 +12,36 @@ from pydantic import ValidationError
 
 from .agent import AnalystAgent, PlanningError
 from .contracts import ArchitectArtifact, decode_json
+from .markdown import parse_architect_markdown, render_analyst_markdown
 
 logger = logging.getLogger("analyst_agent")
 
 
+def _read_bytes(path: Path) -> bytes:
+    if str(path) == "-":
+        return sys.stdin.buffer.read(65_537)
+    return path.read_bytes()
+
+
 def _read_artifact(path: Path) -> ArchitectArtifact:
-    payload = sys.stdin.buffer.read(65_537) if str(path) == "-" else path.read_bytes()
-    return ArchitectArtifact.model_validate(decode_json(payload))
+    payload = _read_bytes(path)
+    stripped = payload.lstrip()
+    is_json = stripped.startswith(b"{") or path.suffix.lower() == ".json"
+    if is_json:
+        return ArchitectArtifact.model_validate(decode_json(payload))
+    text = payload.decode("utf-8")
+    return parse_architect_markdown(text)
+
+
+def _infer_format(path: Path | None, fallback: str) -> str:
+    if path is None:
+        return fallback
+    suffix = path.suffix.lower()
+    if suffix in {".md", ".markdown"}:
+        return "md"
+    if suffix == ".json":
+        return "json"
+    return fallback
 
 
 def _write_new(path: Path, payload: str, repo: Path) -> None:
@@ -40,14 +63,35 @@ def main(argv: list[str] | None = None) -> int:
         description="AnalystAgent: Architect artifact -> validated Coder task"
     )
     parser.add_argument(
-        "--artifact", required=True, type=Path,
-        help="JSON артефакта Архитектора или '-' для stdin",
+        "--artifact",
+        required=True,
+        type=Path,
+        help="Markdown или JSON артефакта Архитектора, либо '-' для stdin",
     )
     parser.add_argument("--repo", help="Путь к репозиторию Miminet")
-    parser.add_argument("--output", type=Path, help="Куда записать Coder task JSON")
-    parser.add_argument("--report", type=Path, help="Куда записать Analyst report JSON")
     parser.add_argument(
-        "--bundle", action="store_true",
+        "--output",
+        type=Path,
+        help="Куда записать артефакт: .md — Markdown, .json — строгий CoderTask",
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        help="Куда записать отчёт: .md или .json",
+    )
+    parser.add_argument(
+        "--task-json",
+        type=Path,
+        help="Дополнительно записать строгий CoderTask в JSON",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["md", "json"],
+        help="Формат вывода в stdout (по умолчанию md)",
+    )
+    parser.add_argument(
+        "--bundle",
+        action="store_true",
         help="Вывести task и report одним JSON в stdout",
     )
     parser.add_argument("--task-id", help="task_id для CoderAgent")
@@ -57,7 +101,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", help="Идентификатор модели (иначе OPENAI_MODEL)")
     parser.add_argument("--base-url", help="Base URL API (иначе OPENAI_BASE_URL)")
     parser.add_argument(
-        "--offline", action="store_true",
+        "--offline",
+        action="store_true",
         help="Без LLM: детерминированный план для тестов",
     )
     parser.add_argument("--verbose", action="store_true")
@@ -68,8 +113,8 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s: %(message)s",
     )
 
-    if args.bundle and (args.output or args.report):
-        parser.error("--bundle нельзя сочетать с --output/--report")
+    if args.bundle and (args.output or args.report or args.task_json):
+        parser.error("--bundle нельзя сочетать с --output/--report/--task-json")
 
     try:
         artifact = _read_artifact(args.artifact)
@@ -86,6 +131,7 @@ def main(argv: list[str] | None = None) -> int:
             workspace_id=args.workspace_id,
             attempt=args.attempt,
         )
+
         task_payload = json.dumps(
             output.task.model_dump(mode="json"), ensure_ascii=False, indent=2
         ) + "\n"
@@ -95,23 +141,51 @@ def main(argv: list[str] | None = None) -> int:
         bundle_payload = json.dumps(
             output.model_dump(mode="json"), ensure_ascii=False, indent=2
         ) + "\n"
+        markdown_payload = render_analyst_markdown(output)
 
         if output.report.status == "NEEDS_CLARIFICATION":
             # Блокирующие вопросы: задание Кодеру не выдаём, возвращаем отчёт.
+            if args.output:
+                payload = (
+                    markdown_payload
+                    if _infer_format(args.output, "md") == "md"
+                    else report_payload
+                )
+                _write_new(args.output, payload, agent.index.repo_path)
             if args.report:
-                _write_new(args.report, report_payload, agent.index.repo_path)
-            print(report_payload, end="", file=sys.stderr)
+                payload = (
+                    markdown_payload
+                    if _infer_format(args.report, "md") == "md"
+                    else report_payload
+                )
+                _write_new(args.report, payload, agent.index.repo_path)
+            if not args.output and not args.report:
+                print(markdown_payload, end="", file=sys.stderr)
             return 1
 
         if args.bundle:
             print(bundle_payload, end="")
         elif args.output:
-            _write_new(args.output, task_payload, agent.index.repo_path)
+            payload = (
+                markdown_payload
+                if _infer_format(args.output, "md") == "md"
+                else task_payload
+            )
+            _write_new(args.output, payload, agent.index.repo_path)
         else:
-            print(task_payload, end="")
+            payload = markdown_payload if (args.format or "md") == "md" else task_payload
+            print(payload, end="")
+
+        if args.task_json:
+            _write_new(args.task_json, task_payload, agent.index.repo_path)
 
         if args.report:
-            _write_new(args.report, report_payload, agent.index.repo_path)
+            payload = (
+                markdown_payload
+                if _infer_format(args.report, "md") == "md"
+                else report_payload
+            )
+            _write_new(args.report, payload, agent.index.repo_path)
     except (PlanningError, RuntimeError, OSError, ValidationError, ValueError) as exc:
         logger.error("%s", exc)
         print(

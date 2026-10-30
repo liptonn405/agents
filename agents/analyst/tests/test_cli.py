@@ -102,6 +102,7 @@ class CliTests(unittest.TestCase):
             artifact_path = Path(out_tmp) / "architect.json"
             artifact_path.write_text(artifact().model_dump_json(), encoding="utf-8")
             output = Path(out_tmp) / "task.json"
+            report_path = Path(out_tmp) / "report.json"
 
             task = CoderTask(
                 task_id="arch-001",
@@ -160,12 +161,14 @@ class CliTests(unittest.TestCase):
                             "--artifact", str(artifact_path),
                             "--repo", str(repo),
                             "--offline",
-                            "--output", str(output),
+                            "--report", str(report_path),
                         ]
                     )
             self.assertEqual(code, 1)
             self.assertFalse(output.exists())
-            self.assertIn("NEEDS_CLARIFICATION", stderr.getvalue())
+            self.assertTrue(report_path.exists())
+            report_data = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report_data["status"], "NEEDS_CLARIFICATION")
 
 
 if __name__ == "__main__":
